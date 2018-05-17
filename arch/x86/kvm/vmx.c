@@ -81,6 +81,7 @@ static bool __read_mostly enable_unrestricted_guest = 1;
 module_param_named(unrestricted_guest,
 			enable_unrestricted_guest, bool, S_IRUGO);
 
+
 static bool __read_mostly enable_ept_ad_bits = 1;
 module_param_named(eptad, enable_ept_ad_bits, bool, S_IRUGO);
 
@@ -1039,13 +1040,82 @@ struct kvm_sgx_epc {
 	struct list_head free;
 	struct list_head used;
 };
+
+//Jupark
+struct kvm_sgx_o_epc {
+	struct kvm *kvm;
+	u64 base;
+	u64 size;
+	struct mutex lock;
+	struct list_head free;
+	struct list_head used;
+};
+
 #define to_sgx_epc(_kvm)    ((struct kvm_sgx_epc *)((_kvm)->arch.priv))
+#define to_sgx_o_epc(_kvm)    ((struct kvm_sgx_o_epc *)((_kvm)->arch.priv2))
 
 static struct sgx_epc_operations kvm_sgx_epc_ops =  {
         .get_ref = NULL,
         .swap_pages = NULL,
 };
 
+static struct sgx_epc_operations kvm_sgx_o_epc_ops =  {
+        .get_ref = NULL,
+        .swap_pages = NULL,
+};
+
+static int kvm_sgx_o_epc_fault(struct vm_fault *vmf)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	struct kvm_sgx_o_epc *o_epc = (struct kvm_sgx_o_epc *)vma->vm_private_data;
+	struct sgx_epc_page *epc_page;
+	pte_t pte;
+	int rc, ret = VM_FAULT_NOPAGE;
+
+	BUG_ON(!o_epc || (vmf->address - vma->vm_start) > o_epc->size);
+
+	mutex_lock(&o_epc->lock);
+
+	/*
+	 * Nothing to do if an EPC page has already been mapped.  We don't
+	 * need to take the PTE lock as PMD is protected by mmap_sem and
+	 * epc->lock ensures we won't see a stale value (unless someone
+	 * else is modifying the PTE, in which case something has already
+	 * gone wrong).
+	 */
+	if (!pmd_none(*vmf->pmd)) {
+		vmf->pte = pte_offset_map(vmf->pmd, vmf->address);
+		pte = *vmf->pte;
+		pte_unmap(vmf->pte);
+		if (unlikely(!pte_none(pte)))
+			goto out;
+	}
+
+	/*
+	 * We don't support oversubscription and we pre-allocate all EPC
+	 * pages, i.e. we screwed up if the list is empty.
+	 */
+	if (WARN_ON(list_empty(&o_epc->free))) {
+		ret = VM_FAULT_SIGBUS;
+		goto out;
+	}
+
+	epc_page = list_first_entry(&o_epc->free, struct sgx_epc_page, list);
+
+	//Jupark
+	printk("Jupark: %s is executed %lld" , __func__, PFN_DOWN(epc_page->pa));
+
+	rc = vm_insert_pfn(vma, vmf->address, PFN_DOWN(epc_page->pa));
+	if (rc)
+		ret = (rc == -EBUSY) ? VM_FAULT_NOPAGE : VM_FAULT_SIGBUS;
+	else
+		list_move_tail(&epc_page->list, &o_epc->used);
+
+
+out:
+	mutex_unlock(&o_epc->lock);
+	return ret;
+}
 static int kvm_sgx_epc_fault(struct vm_fault *vmf)
 {
 	struct vm_area_struct *vma = vmf->vma;
@@ -1084,15 +1154,24 @@ static int kvm_sgx_epc_fault(struct vm_fault *vmf)
 
 	epc_page = list_first_entry(&epc->free, struct sgx_epc_page, list);
 
+	//Jupark
+	//printk("Jupark: %s is executed %lld" , __func__, PFN_DOWN(epc_page->pa));
+
 	rc = vm_insert_pfn(vma, vmf->address, PFN_DOWN(epc_page->pa));
 	if (rc)
 		ret = (rc == -EBUSY) ? VM_FAULT_NOPAGE : VM_FAULT_SIGBUS;
 	else
 		list_move_tail(&epc_page->list, &epc->used);
 
+
 out:
 	mutex_unlock(&epc->lock);
 	return ret;
+}
+
+static void kvm_sgx_o_epc_close(struct vm_area_struct *vma)
+{
+
 }
 
 static void kvm_sgx_epc_close(struct vm_area_struct *vma)
@@ -1100,12 +1179,96 @@ static void kvm_sgx_epc_close(struct vm_area_struct *vma)
 
 }
 
+static struct vm_operations_struct kvm_sgx_o_epc_vm_ops =  {
+	.fault = kvm_sgx_o_epc_fault,
+	/* define close to prevent VMAs from being merged. */
+	.close = kvm_sgx_o_epc_close,
+};
+
 static struct vm_operations_struct kvm_sgx_epc_vm_ops =  {
 	.fault = kvm_sgx_epc_fault,
 	/* define close to prevent VMAs from being merged. */
 	.close = kvm_sgx_epc_close,
 };
 
+static int vmx_enable_virtual_o_epc(struct kvm *kvm, u64 base, u64 size)
+{
+	int ret;
+	struct kvm_memory_slot *slot;
+	struct vm_area_struct *vma;
+
+	struct kvm_sgx_o_epc *o_epc = to_sgx_o_epc(kvm);
+
+	/*
+	 * The EPC has already been initialized for this VM.
+	 */
+	if (o_epc)
+		return -EEXIST;
+
+	/*
+	 * The EPC base and size must be 4k aligned and the region
+	 * must not wrap the 4g boundary.  The base/size alignment
+	 * requirements are intentionally less restrictive than bare
+	 * metal so as to provide finer granularity for slicing up
+	 * the actual EPC.  Bare metal EPC must be naturally aligned
+	 * because the CPU uses range registers to protect the EPC.
+	 */
+	if (!IS_ALIGNED(base, 4096) || !IS_ALIGNED(size, 4096))
+		return -EINVAL;
+
+	if (base < 0x100000000ULL && (base + size) > 0x100000000ULL)
+		return -EINVAL;
+
+	ret = x86_set_memory_region(kvm, SGX_OUTER_EPC_PRIVATE_MEMSLOT, base, size);
+	if (ret)
+		return ret;
+
+	o_epc = kzalloc(sizeof(struct kvm_sgx_o_epc), GFP_KERNEL);
+	if (!o_epc)
+		return -ENOMEM;
+
+	o_epc->kvm = kvm;
+	o_epc->base = base;
+	o_epc->size = size;
+	mutex_init(&o_epc->lock);
+	INIT_LIST_HEAD(&o_epc->free);
+	INIT_LIST_HEAD(&o_epc->used);
+
+	ret = sgx_batch_alloc_pages(size >> PAGE_SHIFT, &o_epc->free, o_epc,
+				    &kvm_sgx_o_epc_ops);
+	if (ret) {
+		kfree(o_epc);
+		return ret;
+	}
+
+	//Jupark if i give kvm->arch.priv then, guest recognize it as normal epc
+	//kvm->arch.priv = o_epc;
+	kvm->arch.priv2 = o_epc;
+
+	/*
+	 * Note that we are not responsible for destroying 'slot'.
+	 */
+	slot = id_to_memslot(kvm_memslots(kvm), SGX_OUTER_EPC_PRIVATE_MEMSLOT);
+	printk("Jupark: %s is executed, id_to_memslot %d\n" , __func__,slot->userspace_addr+1);
+
+	BUG_ON(!slot ||
+		base != slot->base_gfn << PAGE_SHIFT ||
+		size != slot->npages << PAGE_SHIFT);
+
+	//Jupark
+	printk("Jupark: %s is executed, %x %x" , __func__,base,size);
+
+	vma = find_vma_intersection(kvm->mm, slot->userspace_addr,
+				    slot->userspace_addr + 1);
+	BUG_ON(!vma);
+
+	vma->vm_flags |= VM_PFNMAP | VM_IO | VM_DONTEXPAND | VM_DONTDUMP |
+			 VM_DONTCOPY;
+	vma->vm_ops = &kvm_sgx_o_epc_vm_ops;
+	vma->vm_private_data = (void *)o_epc;
+
+	return 0;
+}
 static int vmx_enable_virtual_epc(struct kvm *kvm, u64 base, u64 size)
 {
 	int ret;
@@ -1162,9 +1325,13 @@ static int vmx_enable_virtual_epc(struct kvm *kvm, u64 base, u64 size)
 	 * Note that we are not responsible for destroying 'slot'.
 	 */
 	slot = id_to_memslot(kvm_memslots(kvm), SGX_EPC_PRIVATE_MEMSLOT);
+	printk("Jupark: %s is executed, id_to_memslot %d\n" , __func__, slot->userspace_addr + 1);
 	BUG_ON(!slot ||
 		base != slot->base_gfn << PAGE_SHIFT ||
 		size != slot->npages << PAGE_SHIFT);
+
+	//Jupark
+	printk("Jupark: %s is executed, %x %x" , __func__,base,size);
 
 	vma = find_vma_intersection(kvm->mm, slot->userspace_addr,
 				    slot->userspace_addr + 1);
@@ -1198,12 +1365,15 @@ static int sgx_remove_page(struct sgx_epc_page *epc_page)
 static void vmx_destroy_sgx_epc(struct kvm *kvm)
 {
 	struct kvm_sgx_epc *epc = to_sgx_epc(kvm);
+	struct kvm_sgx_o_epc *o_epc = to_sgx_o_epc(kvm);
 	struct sgx_epc_page *entry, *tmp;
 	LIST_HEAD(secs_pages);
 
 	if (!epc)
 		return;
 
+	if (!o_epc)
+		return;
 	/*
 	 * Because we don't track which pages are SECS pages, it's
 	 * possible for EREMOVE to fail, e.g. a SECS page can have
@@ -1226,10 +1396,26 @@ static void vmx_destroy_sgx_epc(struct kvm *kvm)
 		list_del_init(&entry->list);
 		sgx_free_page(entry);
 	}
+	//Jupark
+	list_for_each_entry_safe(entry, tmp, &o_epc->used, list) {
+		if (sgx_remove_page(entry))
+			list_add(&entry->list, &secs_pages);
+	}
 
+	list_for_each_entry_safe(entry, tmp, &secs_pages, list) {
+		if (WARN_ON(sgx_remove_page(entry)))
+			sgx_free_page(entry);
+	}
+
+	list_for_each_entry_safe(entry, tmp, &o_epc->free, list) {
+		list_del_init(&entry->list);
+		sgx_free_page(entry);
+	}
 	kvm->arch.priv = NULL;
+	kvm->arch.priv2 = NULL;
 
 	kfree(epc);
+	kfree(o_epc);
 }
 
 #define SGX_INTEL_DEFAULT_LEPUBKEYHASH0	0xa6053e051270b7acULL
@@ -3708,6 +3894,8 @@ static int vmx_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
 			vmx_leave_nested(vcpu);
 
 		/* SGX may be enabled/disabled by guest's firmware */
+		//Jupark
+		//printk("KVM: SGX hypercall test\n");
 		vmx_write_encls_bitmap(vcpu, NULL);
 		break;
 	case MSR_IA32_SGXLEPUBKEYHASH0 ... MSR_IA32_SGXLEPUBKEYHASH3:
@@ -8611,6 +8799,8 @@ static int handle_encls(struct kvm_vcpu *vcpu)
 	 * and inject #UD/#GP as needed to prevent the guest from executing
 	 * ENCLS when it's disabled (in the guest).
 	 */
+	
+	printk("handle encls executed");
 	if (!sgx_allowed_in_guest(vcpu))
 		kvm_queue_exception(vcpu, UD_VECTOR);
 	else if (!sgx_enabled_in_guest_bios(vcpu))
@@ -8624,6 +8814,7 @@ static int handle_encls(struct kvm_vcpu *vcpu)
 		 */
 		BUG_ON((u32)vcpu->arch.regs[VCPU_REGS_RAX] != EINIT);
 
+		printk("Handle encls executed");
 		return handle_encls_einit(vcpu);
 #else
 		/*
@@ -10333,6 +10524,8 @@ static void vmx_write_encls_bitmap(struct kvm_vcpu *vcpu,
 			vmcs12 = get_vmcs12(vcpu);
 		if (vmcs12 && nested_cpu_has_encls_exit(vmcs12))
 			encls_bitmap |= vmcs12->encls_exiting_bitmap;
+		//Jupark
+		printk("sgx encls_bitmap executed %lld\n", encls_bitmap);
 	}
 #endif
 	vmcs_write64(ENCLS_EXITING_BITMAP, encls_bitmap);
@@ -10349,6 +10542,7 @@ static int vmx_cpuid_update_sgx(struct kvm_vcpu *vcpu)
 #ifdef CONFIG_INTEL_SGX_CORE
 	struct vcpu_vmx *vmx = to_vmx(vcpu);
 	struct kvm_sgx_epc *epc = to_sgx_epc(vcpu->kvm);
+	struct kvm_sgx_o_epc *o_epc = to_sgx_o_epc(vcpu->kvm);
 	struct kvm_cpuid_entry2 *best;
 
 	/*
@@ -10373,6 +10567,8 @@ static int vmx_cpuid_update_sgx(struct kvm_vcpu *vcpu)
 				~SECONDARY_EXEC_ENCLS_EXITING;
 		return 0;
 	}
+	//Jupark
+	printk("1: update_sgx is called\n");
 
 	/*
 	 * If CPUID.0x7.0:EBX.SGX = 1, SGX can be opt-in{out} in BIOS
@@ -10422,6 +10618,7 @@ static int vmx_cpuid_update_sgx(struct kvm_vcpu *vcpu)
 	best->edx &= (unsigned int)(vcpu->arch.guest_supported_xcr0 >> 32);
 
 	best = kvm_find_cpuid_entry(vcpu, 0x12, 0x2);
+	printk("2: update_sgx is called %x %x %x %x\n", best->eax,best->ebx,best->ecx,best->edx);
 	if (best) {
 		best->eax &= 0xf;
 		if (epc)
@@ -10432,6 +10629,24 @@ static int vmx_cpuid_update_sgx(struct kvm_vcpu *vcpu)
 			best->ecx |= (uint32_t)(epc->size & 0xfffff000);
 		best->edx = epc ? (uint32_t)(epc->size >> 32) : 0;
 	}
+	printk("2: update_sgx is called %x %x %x %x\n", best->eax,best->ebx,best->ecx,best->edx);
+
+	//Jupark 
+	best = kvm_find_cpuid_entry(vcpu, 0x12, 0x3);
+	printk("3: update_sgx is called %x %x %x %x\n", best->eax,best->ebx,best->ecx,best->edx);
+	if (best) {
+		//Jupark
+		printk("3.5: update_sgx is called\n");
+		best->eax &= 0xf;
+		if (o_epc)
+			best->eax |= (uint32_t)(o_epc->base & 0xfffff000);
+		best->ebx = o_epc ? (uint32_t)(o_epc->base >> 32) : 0;
+		best->ecx &= 0xf;
+		if (o_epc)
+			best->ecx |= (uint32_t)(o_epc->size & 0xfffff000);
+		best->edx = o_epc ? (uint32_t)(o_epc->size >> 32) : 0;
+	}
+	printk("3: update_sgx is called %x %x %x %x\n", best->eax,best->ebx,best->ecx,best->edx);
 #endif
 	return 0;
 }
@@ -10502,6 +10717,15 @@ static int vmx_set_supported_cpuid(u32 func, struct kvm_cpuid_entry2 *entry,
 		if (*nent >= maxnent)
 			return -E2BIG;
 		kvm_do_cpuid_entry(++entry, 0x12, 0x2);
+		entry->flags |= KVM_CPUID_FLAG_SIGNIFCANT_INDEX;
+		entry->eax &= ~PAGE_MASK;
+		entry->ebx = 0;
+		++*nent;
+		
+		//Jupark 
+		if (*nent >= maxnent)
+			return -E2BIG;
+		kvm_do_cpuid_entry(++entry, 0x12, 0x3);
 		entry->flags |= KVM_CPUID_FLAG_SIGNIFCANT_INDEX;
 		entry->eax &= ~PAGE_MASK;
 		entry->ebx = 0;
@@ -12830,6 +13054,7 @@ static struct kvm_x86_ops vmx_x86_ops __ro_after_init = {
 	.setup_mce = vmx_setup_mce,
 #ifdef CONFIG_INTEL_SGX_CORE
 	.enable_virtual_epc = vmx_enable_virtual_epc,
+	.enable_virtual_o_epc = vmx_enable_virtual_o_epc,
 #endif
 };
 

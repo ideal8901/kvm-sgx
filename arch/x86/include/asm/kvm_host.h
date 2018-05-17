@@ -39,8 +39,9 @@
 #define KVM_SOFT_MAX_VCPUS 240
 #define KVM_MAX_VCPU_ID 1023
 /* memory slots that are not exposed to userspace */
-#define KVM_PRIVATE_MEM_SLOTS 4
-#define KVM_MEM_SLOTS_NUM 512
+//Jupark
+#define KVM_PRIVATE_MEM_SLOTS 5
+#define KVM_MEM_SLOTS_NUM 513
 #define KVM_USER_MEM_SLOTS (KVM_MEM_SLOTS_NUM - KVM_PRIVATE_MEM_SLOTS)
 
 #define KVM_HALT_POLL_NS_DEFAULT 200000
@@ -838,6 +839,7 @@ struct kvm_arch {
 	bool x2apic_broadcast_quirk_disabled;
 
 	void *priv;     /* x86 vendor specific data */
+	void *priv2;     /* x86 vendor specific data */
 };
 
 struct kvm_vm_stat {
@@ -1067,6 +1069,7 @@ struct kvm_x86_ops {
 
 	void (*setup_mce)(struct kvm_vcpu *vcpu);
 	int (*enable_virtual_epc)(struct kvm *kvm, u64 epc_base, u64 epc_size);
+	int (*enable_virtual_o_epc)(struct kvm *kvm, u64 epc_base, u64 epc_size);
 };
 
 struct kvm_arch_async_pf {
