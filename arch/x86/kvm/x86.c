@@ -2746,6 +2746,9 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
 	case KVM_CAP_X86_VIRTUAL_EPC:
 		r = !!kvm_x86_ops->enable_virtual_epc;
 		break;
+	case KVM_CAP_X86_VIRTUAL_O_EPC:
+		r = !!kvm_x86_ops->enable_virtual_o_epc;
+		break;
 	default:
 		r = 0;
 		break;
@@ -3519,6 +3522,7 @@ long kvm_arch_vcpu_ioctl(struct file *filp,
 		struct kvm_cpuid2 cpuid;
 
 		r = -EFAULT;
+		//printk("BBBBB Jupark, %s: %x %x \n", __func__, cpuid, cpuid_arg->entries);
 		if (copy_from_user(&cpuid, cpuid_arg, sizeof cpuid))
 			goto out;
 		r = kvm_vcpu_ioctl_set_cpuid2(vcpu, &cpuid,
@@ -4007,6 +4011,7 @@ split_irqchip_unlock:
 		r = 0;
 		break;
 	case KVM_CAP_X86_VIRTUAL_EPC:
+		//printk("Jupark, KVM: %s \n",__func__);
 		mutex_lock(&kvm->lock);
 		if (!kvm_x86_ops->enable_virtual_epc)
 			r = -EINVAL;
@@ -4014,6 +4019,18 @@ split_irqchip_unlock:
 			r = -EEXIST;
 		else
 			r = kvm_x86_ops->enable_virtual_epc(kvm,
+							    cap->args[0],
+							    cap->args[1]);
+		mutex_unlock(&kvm->lock);
+		break;
+	case KVM_CAP_X86_VIRTUAL_O_EPC:
+		mutex_lock(&kvm->lock);
+		if (!kvm_x86_ops->enable_virtual_o_epc)
+			r = -EINVAL;
+		else if (kvm->created_vcpus)
+			r = -EEXIST;
+		else
+			r = kvm_x86_ops->enable_virtual_o_epc(kvm,
 							    cap->args[0],
 							    cap->args[1]);
 		mutex_unlock(&kvm->lock);
@@ -4280,6 +4297,7 @@ long kvm_arch_vm_ioctl(struct file *filp,
 		struct kvm_enable_cap cap;
 
 		r = -EFAULT;
+
 		if (copy_from_user(&cap, argp, sizeof(cap)))
 			goto out;
 		r = kvm_vm_ioctl_enable_cap(kvm, &cap);
@@ -6308,17 +6326,18 @@ int kvm_emulate_hypercall(struct kvm_vcpu *vcpu)
 	}
 
 	switch (nr) {
-	case KVM_HC_VAPIC_POLL_IRQ:
+	case KVM_HC_VAPIC_POLL_IRQ: // 1
 		ret = 0;
 		break;
-	case KVM_HC_KICK_CPU:
+	case KVM_HC_KICK_CPU: // 5
 		kvm_pv_kick_cpu_op(vcpu->kvm, a0, a1);
 		ret = 0;
 		break;
 #ifdef CONFIG_X86_64
-	case KVM_HC_CLOCK_PAIRING:
+	case KVM_HC_CLOCK_PAIRING: // 9
 		ret = kvm_pv_clock_pairing(vcpu, a0, a1);
 		break;
+
 #endif
 	default:
 		ret = -KVM_ENOSYS;
@@ -8246,6 +8265,8 @@ void kvm_arch_destroy_vm(struct kvm *kvm)
 		x86_set_memory_region(kvm, IDENTITY_PAGETABLE_PRIVATE_MEMSLOT, 0, 0);
 		x86_set_memory_region(kvm, TSS_PRIVATE_MEMSLOT, 0, 0);
 		x86_set_memory_region(kvm, SGX_EPC_PRIVATE_MEMSLOT, 0, 0);
+		//Jupark
+		x86_set_memory_region(kvm, SGX_OUTER_EPC_PRIVATE_MEMSLOT, 0, 0);
 	}
 	if (kvm_x86_ops->vm_destroy)
 		kvm_x86_ops->vm_destroy(kvm);

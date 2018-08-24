@@ -89,6 +89,14 @@ enum sgx_commands {
 	EAUG	= 0xD,
 	EMODPR	= 0xE,
 	EMODT	= 0xF,
+	
+	EABC		= 0x10,
+	OECREATE	= 0x10,
+	OEADD		= 0x11,
+	OEINIT		= 0x12,
+
+	OEENTER		= 0x10,
+	OEEXIT		= 0x11,
 };
 
 #define IS_ENCLS_FAULT(r) ((r) & 0xffff0000)
@@ -259,19 +267,43 @@ enum sgx_alloc_flags {
 extern struct sgx_epc_page *sgx_alloc_page(unsigned int flags, void *owner,
 					   struct sgx_epc_operations *ops);
 extern int sgx_batch_alloc_pages(int nr_pages, struct list_head *dst,
+				 void *owner, struct sgx_epc_operations *ops, bool is_outer);
+extern int sgx_batch_alloc_outer_pages(int nr_pages, struct list_head *dst,
 				 void *owner, struct sgx_epc_operations *ops);
 extern void sgx_free_page(struct sgx_epc_page *entry);
+extern void sgx_free_outer_page(struct sgx_epc_page *entry);
 extern void *__sgx_get_page(resource_size_t pa);
 static inline void *sgx_get_page(struct sgx_epc_page *entry)
 {
        return __sgx_get_page(entry->pa);
 }
+
+extern void *__sgx_get_outer_page(resource_size_t pa);
+static inline void *sgx_get_outer_page(struct sgx_epc_page *entry)
+{
+       return __sgx_get_outer_page(entry->pa);
+}
+
 extern void sgx_put_page(void *epc_page_vaddr);
+extern void sgx_put_outer_page(void *epc_page_vaddr);
+
 extern void sgx_page_reclaimable(struct sgx_epc_page *epc_page);
 extern void sgx_reclaimable_putback(struct list_head *src);
 extern void sgx_page_defunct(struct sgx_epc_page *epc_page);
 extern int sgx_einit(void *sigstruct, struct sgx_einittoken *einittoken,
 		     void *secs, u64 le_pubkey_hash[4]);
+
+//Jupark
+extern void set_epcm_entry(uint16_t index, bool valid, bool read, bool write,
+                    bool execute, bool blocked, uint8_t pt, uint64_t secs,
+                    uint64_t addr);
+extern uint16_t epcm_search(resource_size_t pa);
+extern struct sgx_secs* get_secs_address(uint16_t index);
+//extern void set_epcm_entry(epcm_entry_t *epcm_entry, bool valid, bool read, bool write,
+//                    bool execute, bool blocked, uint8_t pt, uint64_t secs,
+//                    uint64_t addr);
+//extern uint16_t epcm_search(resource_size_t pa);
+//extern struct sgx_secs* get_secs_address(epcm_entry_t *cur_epcm);
 
 #endif /* CONFIG_INTEL_SGX_CORE */
 

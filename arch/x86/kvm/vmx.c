@@ -263,6 +263,7 @@ struct __packed vmcs12 {
 	u64 eptp_list_address;
 	u64 xss_exit_bitmap;
 	u64 encls_exiting_bitmap;
+	//u64 enclu_exiting_bitmap;
 	u64 guest_physical_address;
 	u64 vmcs_link_pointer;
 	u64 pml_address;
@@ -793,6 +794,7 @@ static const unsigned short vmcs_field_to_offset_table[] = {
 	FIELD64(EPTP_LIST_ADDRESS, eptp_list_address),
 	FIELD64(XSS_EXIT_BITMAP, xss_exit_bitmap),
 	FIELD64(ENCLS_EXITING_BITMAP, encls_exiting_bitmap),
+	//FIELD64(ENCLU_EXITING_BITMAP, enclu_exiting_bitmap),
 	FIELD64(GUEST_PHYSICAL_ADDRESS, guest_physical_address),
 	FIELD64(VMCS_LINK_POINTER, vmcs_link_pointer),
 	FIELD64(PML_ADDRESS, pml_address),
@@ -1103,7 +1105,7 @@ static int kvm_sgx_o_epc_fault(struct vm_fault *vmf)
 	epc_page = list_first_entry(&o_epc->free, struct sgx_epc_page, list);
 
 	//Jupark
-	printk("Jupark: %s is executed %lld" , __func__, PFN_DOWN(epc_page->pa));
+	//printk("Jupark: %s is executed %lld" , __func__, PFN_DOWN(epc_page->pa));
 
 	rc = vm_insert_pfn(vma, vmf->address, PFN_DOWN(epc_page->pa));
 	if (rc)
@@ -1234,8 +1236,10 @@ static int vmx_enable_virtual_o_epc(struct kvm *kvm, u64 base, u64 size)
 	INIT_LIST_HEAD(&o_epc->free);
 	INIT_LIST_HEAD(&o_epc->used);
 
+	printk("Jupark: before batch alloc");
 	ret = sgx_batch_alloc_pages(size >> PAGE_SHIFT, &o_epc->free, o_epc,
-				    &kvm_sgx_o_epc_ops);
+				    &kvm_sgx_o_epc_ops, true);
+	printk("Jupark: after batch alloc");
 	if (ret) {
 		kfree(o_epc);
 		return ret;
@@ -1249,14 +1253,13 @@ static int vmx_enable_virtual_o_epc(struct kvm *kvm, u64 base, u64 size)
 	 * Note that we are not responsible for destroying 'slot'.
 	 */
 	slot = id_to_memslot(kvm_memslots(kvm), SGX_OUTER_EPC_PRIVATE_MEMSLOT);
-	printk("Jupark: %s is executed, id_to_memslot %d\n" , __func__,slot->userspace_addr+1);
 
 	BUG_ON(!slot ||
 		base != slot->base_gfn << PAGE_SHIFT ||
 		size != slot->npages << PAGE_SHIFT);
 
 	//Jupark
-	printk("Jupark: %s is executed, %x %x" , __func__,base,size);
+//	printk("Jupark: %s is executed, %x %x" , __func__,base,size);
 
 	vma = find_vma_intersection(kvm->mm, slot->userspace_addr,
 				    slot->userspace_addr + 1);
@@ -1313,7 +1316,7 @@ static int vmx_enable_virtual_epc(struct kvm *kvm, u64 base, u64 size)
 	INIT_LIST_HEAD(&epc->used);
 
 	ret = sgx_batch_alloc_pages(size >> PAGE_SHIFT, &epc->free, epc,
-				    &kvm_sgx_epc_ops);
+				    &kvm_sgx_epc_ops, false);
 	if (ret) {
 		kfree(epc);
 		return ret;
@@ -1325,13 +1328,13 @@ static int vmx_enable_virtual_epc(struct kvm *kvm, u64 base, u64 size)
 	 * Note that we are not responsible for destroying 'slot'.
 	 */
 	slot = id_to_memslot(kvm_memslots(kvm), SGX_EPC_PRIVATE_MEMSLOT);
-	printk("Jupark: %s is executed, id_to_memslot %d\n" , __func__, slot->userspace_addr + 1);
+	//printk("Jupark: %s is executed, id_to_memslot %d\n" , __func__, slot->userspace_addr + 1);
 	BUG_ON(!slot ||
 		base != slot->base_gfn << PAGE_SHIFT ||
 		size != slot->npages << PAGE_SHIFT);
 
 	//Jupark
-	printk("Jupark: %s is executed, %x %x" , __func__,base,size);
+	//printk("Jupark: %s is executed, %x %x" , __func__,base,size);
 
 	vma = find_vma_intersection(kvm->mm, slot->userspace_addr,
 				    slot->userspace_addr + 1);
@@ -1345,7 +1348,7 @@ static int vmx_enable_virtual_epc(struct kvm *kvm, u64 base, u64 size)
 	return 0;
 }
 
-static int sgx_remove_page(struct sgx_epc_page *epc_page)
+static int sgx_remove_page(struct sgx_epc_page *epc_page, bool is_outer)
 {
 	int ret;
 	void *va;
@@ -1356,7 +1359,9 @@ static int sgx_remove_page(struct sgx_epc_page *epc_page)
 	ret = __eremove(va);
 	sgx_put_page(va);
 
-	if (!ret)
+	if (!ret && is_outer)
+		sgx_free_outer_page(epc_page);
+	else if(!ret)
 		sgx_free_page(epc_page);
 
 	return ret;
@@ -1383,12 +1388,12 @@ static void vmx_destroy_sgx_epc(struct kvm *kvm)
 	 * SECS can be nuked as well.
 	 */
 	list_for_each_entry_safe(entry, tmp, &epc->used, list) {
-		if (sgx_remove_page(entry))
+		if (sgx_remove_page(entry, false))
 			list_add(&entry->list, &secs_pages);
 	}
 
 	list_for_each_entry_safe(entry, tmp, &secs_pages, list) {
-		if (WARN_ON(sgx_remove_page(entry)))
+		if (WARN_ON(sgx_remove_page(entry, false)))
 			sgx_free_page(entry);
 	}
 
@@ -1398,18 +1403,18 @@ static void vmx_destroy_sgx_epc(struct kvm *kvm)
 	}
 	//Jupark
 	list_for_each_entry_safe(entry, tmp, &o_epc->used, list) {
-		if (sgx_remove_page(entry))
+		if (sgx_remove_page(entry, true))
 			list_add(&entry->list, &secs_pages);
 	}
 
 	list_for_each_entry_safe(entry, tmp, &secs_pages, list) {
-		if (WARN_ON(sgx_remove_page(entry)))
-			sgx_free_page(entry);
+		if (WARN_ON(sgx_remove_page(entry, true)))
+			sgx_free_outer_page(entry);
 	}
 
 	list_for_each_entry_safe(entry, tmp, &o_epc->free, list) {
 		list_del_init(&entry->list);
-		sgx_free_page(entry);
+		sgx_free_outer_page(entry);
 	}
 	kvm->arch.priv = NULL;
 	kvm->arch.priv2 = NULL;
@@ -1557,6 +1562,12 @@ static inline bool cpu_has_vmx_encls_vmexit(void)
 	return vmcs_config.cpu_based_2nd_exec_ctrl &
 		SECONDARY_EXEC_ENCLS_EXITING;
 }
+
+//static inline bool cpu_has_vmx_enclu_vmexit(void)
+//{
+//	return vmcs_config.cpu_based_2nd_exec_ctrl &
+//		SECONDARY_EXEC_ENCLU_EXITING;
+//}
 
 /*
  * Comment's format: document - errata name - stepping - processor name.
@@ -1854,6 +1865,11 @@ static inline bool nested_cpu_has_eptp_switching(struct vmcs12 *vmcs12)
 		(vmcs12->vm_function_control &
 		 VMX_VMFUNC_EPTP_SWITCHING);
 }
+
+//static inline bool nested_cpu_has_enclu_exit(struct vmcs12 *vmcs12)
+//{
+//	return nested_cpu_has2(vmcs12, SECONDARY_EXEC_ENCLU_EXITING);
+//}
 
 static inline bool nested_cpu_has_encls_exit(struct vmcs12 *vmcs12)
 {
@@ -3346,7 +3362,11 @@ static void nested_vmx_setup_ctls_msrs(struct vcpu_vmx *vmx)
 
 	if (enable_sgx)
 		vmx->nested.nested_vmx_secondary_ctls_high |=
-			SECONDARY_EXEC_ENCLS_EXITING;
+			SECONDARY_EXEC_ENCLS_EXITING; 
+//	if (enable_sgx)
+//		vmx->nested.nested_vmx_secondary_ctls_high |=
+//			(SECONDARY_EXEC_ENCLS_EXITING |
+//			SECONDARY_EXEC_ENCLU_EXITING);
 
 	/* miscellaneous data */
 	rdmsr(MSR_IA32_VMX_MISC,
@@ -3809,6 +3829,8 @@ static int vmx_get_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
 static void vmx_leave_nested(struct kvm_vcpu *vcpu);
 static void vmx_write_encls_bitmap(struct kvm_vcpu *vcpu,
 				   struct vmcs12 *vmcs12);
+//static void vmx_write_enclu_bitmap(struct kvm_vcpu *vcpu,
+//				   struct vmcs12 *vmcs12);
 
 /*
  * Writes msr value into into the appropriate "register".
@@ -3895,8 +3917,8 @@ static int vmx_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
 
 		/* SGX may be enabled/disabled by guest's firmware */
 		//Jupark
-		//printk("KVM: SGX hypercall test\n");
 		vmx_write_encls_bitmap(vcpu, NULL);
+		//vmx_write_enclu_bitmap(vcpu, NULL);
 		break;
 	case MSR_IA32_SGXLEPUBKEYHASH0 ... MSR_IA32_SGXLEPUBKEYHASH3:
 #ifndef CONFIG_INTEL_SGX_CORE
@@ -4181,6 +4203,9 @@ static __init int setup_vmcs_config(struct vmcs_config *vmcs_conf)
 			SECONDARY_EXEC_TSC_SCALING |
 			SECONDARY_EXEC_ENABLE_VMFUNC |
 			SECONDARY_EXEC_ENCLS_EXITING;
+//			 |
+//			SECONDARY_EXEC_ENCLU_EXITING; 
+
 		if (adjust_vmx_controls(min2, opt2,
 					MSR_IA32_VMX_PROCBASED_CTLS2,
 					&_cpu_based_2nd_exec_control) < 0)
@@ -6059,9 +6084,12 @@ static int vmx_vcpu_setup(struct vcpu_vmx *vmx)
 		vmcs_write16(GUEST_PML_INDEX, PML_ENTITY_NUM - 1);
 	}
 
-	if (cpu_has_vmx_encls_vmexit())
+	if (cpu_has_vmx_encls_vmexit()){
 		vmcs_write64(ENCLS_EXITING_BITMAP, -1ull);
-
+	}
+//	if (cpu_has_vmx_enclu_vmexit()){
+//		vmcs_write64(ENCLU_EXITING_BITMAP, -1ull);
+//	}
 	return 0;
 }
 
@@ -6823,9 +6851,30 @@ static int handle_halt(struct kvm_vcpu *vcpu)
 	return kvm_emulate_halt(vcpu);
 }
 
+static int sgx_o_eenter(struct kvm_vcpu *vcpu);
+static int sgx_o_eexit(struct kvm_vcpu *vcpu);
+
 static int handle_vmcall(struct kvm_vcpu *vcpu)
 {
-	return kvm_emulate_hypercall(vcpu);
+	u32 rax = (u32)vcpu->arch.regs[VCPU_REGS_RAX];
+	u32 rbx = (u32)vcpu->arch.regs[VCPU_REGS_RBX];
+	u32 rcx = (u32)vcpu->arch.regs[VCPU_REGS_RCX];
+	u32 rdx = (u32)vcpu->arch.regs[VCPU_REGS_RDX];
+
+	switch(rax){
+		case KVM_ENCLU_OEENTER: // 21	
+			//kvm_register_write(vcpu, VCPU_REGS_RAX, 0);
+			sgx_o_eenter(vcpu);
+			break;
+	
+		case KVM_ENCLU_OEEXIT: // 22
+			//kvm_register_write(vcpu, VCPU_REGS_RAX, 0);
+			sgx_o_eexit(vcpu);
+			break;
+	default:
+		return kvm_emulate_hypercall(vcpu);
+	}
+	return 0;
 }
 
 static int handle_invd(struct kvm_vcpu *vcpu)
@@ -7385,6 +7434,7 @@ static __init int hardware_setup(void)
 	kvm_mce_cap_supported |= MCG_LMCE_P;
 
 #ifdef CONFIG_INTEL_SGX_CORE
+	// TODO cpu_has_vmx_enclu_vmext()
 	if (!sgx_enabled || !cpu_has_vmx_encls_vmexit())
 		enable_sgx = 0;
 #endif
@@ -8791,6 +8841,296 @@ out:
 }
 #endif /* CONFIG_INTEL_SGX_CORE */
 
+#ifdef CONFIG_INTEL_SGX_CORE
+
+struct sgx_page_info {
+        u64 linaddr;
+        u64 srcpge;
+        union {
+                u64 secinfo;
+                u64 pcmd;
+        };
+        u64 secs;
+} __aligned(32);
+
+typedef enum {
+    PT_SECS = 0x00,                     // Page is SECS
+    PT_TCS  = 0x01,                     // Page is TCS
+    PT_REG  = 0x02,                     // Page is a normal page
+    PT_VA   = 0x03,                     // Page is a Version Array
+    PT_TRIM = 0x04                      // Page is in trimmed state
+} page_type_t;
+
+static void* gva_to_hva(struct kvm_vcpu *vcpu, void* vaddr, bool in_epc){
+
+	struct x86_exception ex = { .vector = 0 };
+	gpa_t paddr;
+
+	paddr = (void *)kvm_mmu_gva_to_gpa_write(vcpu, vaddr, &ex);
+
+	if(in_epc){
+		kvm_pfn_t pfn;
+		pfn = gfn_to_pfn(vcpu->kvm, PFN_DOWN(paddr));
+		if (is_error_pfn(pfn))
+		{
+			printk("gva_to_hva filaed 1\n");
+			return -EFAULT;
+		}
+		void *epc_page = __sgx_get_outer_page(pfn << PAGE_SHIFT);
+		return (epc_page +
+			(unsigned long)(paddr &(PAGE_SIZE-1)));
+	}
+	else{
+		struct page *page;
+		page = gfn_to_page(vcpu->kvm, PFN_DOWN(paddr));
+		if (is_error_page(page)) {
+			printk("gva_to_hva filaed 2\n");
+			return -EFAULT;
+		}
+	
+		return ((void *)kmap(page) +
+			(unsigned long)(paddr &(PAGE_SIZE-1)));
+	}
+}
+static int sgx_o_ecreate(struct kvm_vcpu *vcpu)
+{
+	// RBX: PAGEINFO(In, EA)
+	// RCX: EPCPAGE(In, EA)
+
+	struct vcpu_vmx *vmx = to_vmx(vcpu);
+	struct kvm_sgx_o_epc *o_epc = to_sgx_o_epc(vcpu->kvm);
+	struct x86_exception ex = { .vector = 0 };
+
+	kvm_pfn_t secs_pfn;
+	void *pginfo_vaddr = (struct sgx_page_info *)vcpu->arch.regs[VCPU_REGS_RBX];
+	struct sgx_page_info *pginfo = (struct sgx_page_info *)gva_to_hva(vcpu,pginfo_vaddr,false);
+
+	void *secs_vaddr = (void *)vcpu->arch.regs[VCPU_REGS_RCX];
+	gpa_t secs_paddr;
+	struct sgx_secs *secs;
+
+	secs_paddr = (void *)kvm_mmu_gva_to_gpa_write(vcpu, secs_vaddr, &ex);
+
+	if (secs_paddr == UNMAPPED_GVA)
+		goto page_fault;
+	if (secs_paddr < o_epc->base || secs_paddr >= (o_epc->base + o_epc->size))
+		goto page_fault;
+
+	//pginfo_paddr = (struct sgx_page_info *)kvm_mmu_gva_to_gpa_write(vcpu, pginfo_vaddr, &ex2);
+	secs_pfn = gfn_to_pfn(vcpu->kvm, PFN_DOWN(secs_paddr));
+	if (is_error_pfn(secs_pfn))
+		goto page_fault;
+
+	secs = __sgx_get_outer_page(secs_pfn << PAGE_SHIFT);
+	//secs = __sgx_get_page(secs_pfn << PAGE_SHIFT);
+	if (!secs)
+		goto page_fault;
+
+	// gfn_to_virt
+	void *tmp_srcpge = gva_to_hva(vcpu, pginfo->srcpge, false);
+//	struct sgx_secinfo *tmp_secinfo = gva_to_hva(vcpu, pginfo->secinfo,false);
+//	struct sgx_secs *tmp_secs_pi = gva_to_hva(vcpu, pginfo->secs, false);
+//	void *tmp_linaddr = gva_to_hva(vcpu, pginfo->linaddr, false);
+
+	printk("1 ocreate\n");
+	printk("1 pginfo_vaddr %llx\n", pginfo_vaddr);
+	printk("1 pginfo %llx\n", pginfo);
+	printk("1 pginfo->srcpge %llx\n", pginfo->srcpge);
+	printk("1 tmp_srcpge %llx\n", tmp_srcpge);
+
+//	memset((void*)secs, 0, PAGE_SIZE);
+	printk("1 secs %llx\n", secs);
+	memcpy((void*)secs, tmp_srcpge, PAGE_SIZE);
+	printk("2 ocreate\n");
+
+	if (secs)
+		sgx_put_outer_page(secs);
+	//sgx_put_page
+
+	uint16_t index_secs = epcm_search(secs_pfn << PAGE_SHIFT);
+  	set_epcm_entry(index_secs, 1, 0, 0, 0, 0, PT_SECS, 0, 0);
+
+	kvm_register_write(vcpu, VCPU_REGS_RAX, 0);
+	kvm_skip_emulated_instruction(vcpu);
+
+	return 1;
+
+page_fault:
+	if (!ex.vector) {
+		ex.vector = PF_VECTOR;
+		ex.error_code = (PFERR_PRESENT_MASK |
+				 PFERR_WRITE_MASK |
+				 PFERR_SGX_MASK);
+		ex.address = secs;
+		ex.error_code_valid = true;
+		ex.nested_page_fault = false;
+	}
+	//kvm_inject_page_fault(vcpu, &ex);
+
+out:
+	if (secs)
+		sgx_put_outer_page(secs);
+	return 1;
+}
+
+static int sgx_o_eadd(struct kvm_vcpu *vcpu)
+{
+	// RBX: PAGEINFO(In, EA)
+	// RCX: EPCPAGE(In, EA)
+
+	struct vcpu_vmx *vmx = to_vmx(vcpu);
+	struct kvm_sgx_o_epc *o_epc = to_sgx_o_epc(vcpu->kvm);
+	struct x86_exception ex = { .vector = 0 };
+
+	void *pginfo_vaddr = (struct sgx_page_info *)vcpu->arch.regs[VCPU_REGS_RBX];
+	struct sgx_page_info *pginfo = (struct sgx_page_info *)gva_to_hva(vcpu,pginfo_vaddr, false);
+
+	void *dest_vaddr = (void *)vcpu->arch.regs[VCPU_REGS_RCX];
+	gpa_t dest_paddr;
+	kvm_pfn_t dest_pfn;
+	void *dest;
+
+	dest_paddr = (void *)kvm_mmu_gva_to_gpa_write(vcpu, dest_vaddr, &ex);
+	dest_pfn = gfn_to_pfn(vcpu->kvm, PFN_DOWN(dest_paddr));
+	dest = __sgx_get_outer_page(dest_pfn << PAGE_SHIFT);
+	
+	void *tmp_srcpge = gva_to_hva(vcpu, pginfo->srcpge, false);
+//	struct sgx_secinfo *tmp_secinfo = gva_to_hva(vcpu, pginfo->secinfo, false);
+//	struct sgx_secs *tmp_secs_pi = gva_to_hva(vcpu, pginfo->secs);
+	void *tmp_linaddr = gva_to_hva(vcpu, pginfo->linaddr, true);
+
+	void *secs_vaddr = pginfo->secs; 
+	gpa_t secs_paddr;
+	kvm_pfn_t secs_pfn;
+	struct sgx_secs *secs;
+
+	secs_paddr = (void *)kvm_mmu_gva_to_gpa_write(vcpu, secs_vaddr, &ex);
+	secs_pfn = gfn_to_pfn(vcpu->kvm, PFN_DOWN(secs_paddr));
+	secs = __sgx_get_outer_page(secs_pfn << PAGE_SHIFT);
+
+//	struct sgx_secinfo scratch_secinfo;
+//
+//	memcpy(&scratch_secinfo, tmp_secinfo, sizeof(sgx_secinfo));
+
+//	uint16_t index_page = epcm_search(dest_pfn << PAGE_SHIFT);
+//	uint16_t index_secs = epcm_search(secs, env);
+
+	memcpy(dest, tmp_srcpge, PAGE_SIZE);
+
+	uint16_t index = epcm_search(dest_pfn << PAGE_SHIFT);
+	set_epcm_entry(index, 1, 0,
+	               0, 0, 0,
+	               PT_REG, (uint64_t)secs_pfn << PAGE_SHIFT,
+	               (uintptr_t)tmp_linaddr);
+
+	kvm_register_write(vcpu, VCPU_REGS_RAX, 0);
+
+	if (secs)
+		sgx_put_outer_page(secs);
+	if (dest)
+		sgx_put_outer_page(dest);
+
+	return 1;
+}
+
+static int sgx_o_einit(struct kvm_vcpu *vcpu)
+{
+	// RBX: SIGSTRUCT(In, EA)
+	// RCX: SECS(In, EA)
+	// RDX: EINITTOKEN(In, EA)
+//	struct sgx_page_info *pginfo = (sgx_page_info *)vcpu->arch.regs[VCPU_REGS_RBX];
+//	struct sgx_secs *secs = (void *)vcpu->arch.regs[VCPU_REGS_RCX];
+	kvm_register_write(vcpu, VCPU_REGS_RAX, 0);
+	return 1;
+}
+
+static int sgx_o_eenter(struct kvm_vcpu *vcpu)
+{
+	// RBX: TCS(In, EA)
+	// RCX: AEP(In, EA)
+	// RAX: Error(Out, ErrorCode)
+	// RCX: Address_IP_Following_EENTER(Out, EA)
+//	bool tmp_mode64;
+//	uint64_t tmp_fsbase;
+////	uint64_t tmp_fslimit;
+//	uint64_t tmp_gsbase;
+////	uint64_t tmp_gslimit;
+//	uint64_t tmp_ssa;
+//	uint64_t tmp_xsize;
+//	uint64_t tmp_gpr;
+////	uint64_t tmp_target;
+//	uint64_t eid;
+////	uint16_t index_gpr;
+////	uint16_t index_tcs;
+//
+//	struct x86_exception ex = { .vector = 0 };
+//
+//	uint64_t *aep = (uint64_t *)vcpu->arch.regs[VCPU_REGS_RCX];
+////
+//	void *tcs_vaddr = (void *)vcpu->arch.regs[VCPU_REGS_RBX];
+//	gpa_t tcs_paddr = (void *)kvm_mmu_gva_to_gpa_write(vcpu, tcs_vaddr, &ex);
+//	kvm_pfn_t tcs_pfn = gfn_to_pfn(vcpu->kvm, PFN_DOWN(tcs_paddr));
+//	struct sgx_tcs *tcs;// = __sgx_get_page(tcs_pfn << PAGE_SHIFT);
+//	tcs = gva_to_hva(vcpu, tcs_vaddr, true);
+//
+//	uint16_t index_tcs = epcm_search(tcs_pfn << PAGE_SHIFT);
+//	kvm_pfn_t secs_pfn =  PFN_DOWN((uint64_t)get_secs_address(index_tcs)); // TODO: Change when the ENCLS is implemented - pageinfo_t
+//	struct sgx_secs *secs = __sgx_get_outer_page(secs_pfn << PAGE_SHIFT);
+//
+//	// TODO add 32bit options
+//	tmp_fsbase = tcs->ofsbase + gva_to_hva(vcpu, secs->base, true);
+//	tmp_gsbase = tcs->ogsbase + gva_to_hva(vcpu, secs->base, true);
+//
+//	printk("oeenter %llx, %llx %x\n", secs->base, tcs->ofsbase, tcs->ogsbase);
+////
+//	secs_eid_reserved_t *tmp_eid = (secs_eid_reserved_t *)secs->reserved4; //gva_to_hva(vcpu, secs->reserved4, true);
+//	eid = tmp_eid->eid_pad.eid; 
+////
+//	tmp_ssa = tcs->ossa + secs->base + PAGE_SIZE * secs->ssaframesize * (tcs->cssa);
+//	tmp_xsize = 576;  
+//
+////	tmp_gpr = tmp_ssa + PAGE_SIZE * (secs->ssaframesize) - sizeof(gprsgx_t);
+////	index_gpr = epcm_search((void *)tmp_gpr, 
+////
+////	printk("3 oeenter\n");
+////	printk("index_tcs, secs_pfn in oeenter %d, %x\n", index_tcs, secs_pfn);
+//	
+//	kvm_register_write(vcpu, VCPU_REGS_RAX, tcs->cssa);
+//	if (secs)
+//		sgx_put_outer_page(secs);
+//
+//	vmx_flush_tlb(vcpu);
+//	//vmx_set_segment
+//	//kvm_register_write(vcpu, VCPU_REGS_RCX, tcs->cssa);
+//
+////struct kvm_segment {
+////	__u64 base;
+////	__u32 limit;
+////	__u16 selector;
+////	__u8  type;
+////	__u8  present, dpl, db, s, l, g, avl;
+////	__u8  unusable;
+////	__u8  padding;
+////};
+//
+////	void (*set_segment)(struct kvm_vcpu *vcpu,
+////			    struct kvm_segment *var, int seg);
+////	set_segment(vcpu,  
+//	//tlb_flush(vcpu);
+//
+	return 0;
+}
+
+static int sgx_o_eexit(struct kvm_vcpu *vcpu)
+{
+	// RBX: Target_Address(In, EA)
+	// RCX: Current_AEP(In, EA)
+	kvm_register_write(vcpu, VCPU_REGS_RAX, -1);
+	return 1;
+}
+#else
+#endif
+
 static int handle_encls(struct kvm_vcpu *vcpu)
 {
 	/*
@@ -8800,7 +9140,8 @@ static int handle_encls(struct kvm_vcpu *vcpu)
 	 * ENCLS when it's disabled (in the guest).
 	 */
 	
-	printk("handle encls executed");
+	uint32_t rax = 0;
+
 	if (!sgx_allowed_in_guest(vcpu))
 		kvm_queue_exception(vcpu, UD_VECTOR);
 	else if (!sgx_enabled_in_guest_bios(vcpu))
@@ -8812,10 +9153,20 @@ static int handle_encls(struct kvm_vcpu *vcpu)
 		 * in the guest, we should never reach this point with a leaf
 		 * other than EINIT.
 		 */
-		BUG_ON((u32)vcpu->arch.regs[VCPU_REGS_RAX] != EINIT);
+		//BUG_ON((u32)vcpu->arch.regs[VCPU_REGS_RAX] != EINIT);
 
-		printk("Handle encls executed");
-		return handle_encls_einit(vcpu);
+		if((u32)vcpu->arch.regs[VCPU_REGS_RAX]  == EINIT){
+			return handle_encls_einit(vcpu);
+		}
+		else if((u32)vcpu->arch.regs[VCPU_REGS_RAX]  == OECREATE){
+			return sgx_o_ecreate(vcpu);
+		}
+		else if((u32)vcpu->arch.regs[VCPU_REGS_RAX]  == OEADD){
+			return sgx_o_eadd(vcpu);
+		}
+		else if((u32)vcpu->arch.regs[VCPU_REGS_RAX]  == OEINIT){
+			return sgx_o_einit(vcpu);
+		}
 #else
 		/*
 		 * SGX is disabled in the host, so it should be impossible for
@@ -8882,6 +9233,7 @@ static int (*const kvm_vmx_exit_handlers[])(struct kvm_vcpu *vcpu) = {
 	[EXIT_REASON_VMFUNC]                  = handle_vmfunc,
 	[EXIT_REASON_PREEMPTION_TIMER]	      = handle_preemption_timer,
 	[EXIT_REASON_ENCLS]		      = handle_encls,
+	//[EXIT_REASON_ENCLU]		      = handle_enclu,
 };
 
 static const int kvm_vmx_max_exit_handlers =
@@ -9051,6 +9403,20 @@ static bool nested_vmx_exit_handled_cr(struct kvm_vcpu *vcpu,
 	}
 	return false;
 }
+
+//static bool nested_vmx_exit_handled_enclu(struct kvm_vcpu *vcpu,
+//					  struct vmcs12 *vmcs12)
+//{
+//	u32 enclu_leaf;
+//
+//	if (!nested_cpu_has2(vmcs12, SECONDARY_EXEC_ENCLU_EXITING))
+//		return false;
+//
+//	enclu_leaf = vcpu->arch.regs[VCPU_REGS_RAX];
+//	if (enclu_leaf > 62)
+//		enclu_leaf = 63;
+//	return (vmcs12->enclu_exiting_bitmap & (1ULL << enclu_leaf));
+//}
 
 static bool nested_vmx_exit_handled_encls(struct kvm_vcpu *vcpu,
 					  struct vmcs12 *vmcs12)
@@ -9234,8 +9600,12 @@ static bool nested_vmx_exit_reflected(struct kvm_vcpu *vcpu, u32 exit_reason)
 	case EXIT_REASON_VMFUNC:
 		/* VM functions are emulated through L2->L0 vmexits. */
 		return false;
+
 	case EXIT_REASON_ENCLS:
 		return nested_vmx_exit_handled_encls(vcpu, vmcs12);
+
+//	case EXIT_REASON_ENCLU:
+//		return nested_vmx_exit_handled_enclu(vcpu, vmcs12);
 	default:
 		return true;
 	}
@@ -10483,6 +10853,45 @@ static void nested_vmx_cr_fixed1_bits_update(struct kvm_vcpu *vcpu)
 #undef cr4_fixed1_update
 }
 
+//static void vmx_write_enclu_bitmap(struct kvm_vcpu *vcpu,
+//					struct vmcs12 *vmcs12)
+//{
+//	u64 enclu_bitmap = -1ull;
+//
+//	printk("sgx enclu_bitmap executed 1 %lld\n", enclu_bitmap);
+//	/* Nothing to do if hardware doesn't support SGX */
+//	if (!cpu_has_vmx_enclu_vmexit())
+//		return;
+//
+//	printk("sgx enclu_bitmap executed 2 %lld\n", enclu_bitmap);
+//#ifdef CONFIG_INTEL_SGX_CORE
+//	if (sgx_allowed_in_guest(vcpu) && sgx_enabled_in_guest_bios(vcpu)) {
+//		/*
+//		 * If launch control is enabled in the host, EINIT must be
+//		 * trapped and executed by the host to avoid races between
+//		 * the host and guest regarding the launch control MSRs,
+//		 * which are not loaded/saved on VMEntry/VMexit (they aren't
+//		 * allowed in the hardware-supported lists and writing the
+//		 * MSRs is extraordinarily expensive).
+//		 */
+//		printk("sgx encls_bitmap executed 3 %lld\n", enclu_bitmap);
+//		enclu_bitmap = 0;
+//
+//		if (!vmcs12 && nested && is_guest_mode(vcpu))
+//			vmcs12 = get_vmcs12(vcpu);
+//		if (vmcs12 && nested_cpu_has_enclu_exit(vmcs12))
+//			enclu_bitmap |= vmcs12->enclu_exiting_bitmap;
+//		//Jupark
+//		enclu_bitmap |= 1 << OEENTER;
+//
+//		printk("sgx enclu_bitmap executed %lld\n", enclu_bitmap);
+//	}
+//#endif
+//	vmcs_write64(ENCLU_EXITING_BITMAP, enclu_bitmap);
+//
+//
+//}
+
 static void vmx_write_encls_bitmap(struct kvm_vcpu *vcpu,
 				   struct vmcs12 *vmcs12)
 {
@@ -10525,6 +10934,10 @@ static void vmx_write_encls_bitmap(struct kvm_vcpu *vcpu,
 		if (vmcs12 && nested_cpu_has_encls_exit(vmcs12))
 			encls_bitmap |= vmcs12->encls_exiting_bitmap;
 		//Jupark
+		encls_bitmap |= 1 << OECREATE;
+		encls_bitmap |= 1 << OEADD;
+		encls_bitmap |= 1 << OEINIT;
+
 		printk("sgx encls_bitmap executed %lld\n", encls_bitmap);
 	}
 #endif
@@ -10550,6 +10963,7 @@ static int vmx_cpuid_update_sgx(struct kvm_vcpu *vcpu)
 	 * that its current state reflects "SGX disabled".
 	 */
 	vmx_write_encls_bitmap(vcpu, NULL);
+	//vmx_write_enclu_bitmap(vcpu, NULL);
 
 	if (!sgx_allowed_in_guest(vcpu)) {
 		/*
@@ -10565,6 +10979,9 @@ static int vmx_cpuid_update_sgx(struct kvm_vcpu *vcpu)
 		if (nested_vmx_allowed(vcpu))
 			vmx->nested.nested_vmx_secondary_ctls_high &=
 				~SECONDARY_EXEC_ENCLS_EXITING;
+//		if (nested_vmx_allowed(vcpu))
+//			vmx->nested.nested_vmx_secondary_ctls_high &=
+//				~(SECONDARY_EXEC_ENCLS_EXITING | SECONDARY_EXEC_ENCLU_EXITING);
 		return 0;
 	}
 	//Jupark
@@ -10576,9 +10993,13 @@ static int vmx_cpuid_update_sgx(struct kvm_vcpu *vcpu)
 	 * can be enabled by the guest when SGX is supported.
 	 */
 	vmx->msr_ia32_feature_control_valid_bits |= FEATURE_CONTROL_SGX_ENABLE;
-	if (nested_vmx_allowed(vcpu))
+	if (nested_vmx_allowed(vcpu)){
 		vmx->nested.nested_vmx_secondary_ctls_high |=
-			SECONDARY_EXEC_ENCLS_EXITING;
+			SECONDARY_EXEC_ENCLS_EXITING; 
+//		vmx->nested.nested_vmx_secondary_ctls_high |=
+//			SECONDARY_EXEC_ENCLU_EXITING; 
+	}
+
 	if (sgx_lc_enabled && guest_cpuid_has(vcpu, X86_FEATURE_SGX_LC))
 		vmx->msr_ia32_feature_control_valid_bits |=
 			FEATURE_CONTROL_SGX_LAUNCH_CONTROL_ENABLE;
@@ -10618,7 +11039,6 @@ static int vmx_cpuid_update_sgx(struct kvm_vcpu *vcpu)
 	best->edx &= (unsigned int)(vcpu->arch.guest_supported_xcr0 >> 32);
 
 	best = kvm_find_cpuid_entry(vcpu, 0x12, 0x2);
-	printk("2: update_sgx is called %x %x %x %x\n", best->eax,best->ebx,best->ecx,best->edx);
 	if (best) {
 		best->eax &= 0xf;
 		if (epc)
@@ -10629,14 +11049,8 @@ static int vmx_cpuid_update_sgx(struct kvm_vcpu *vcpu)
 			best->ecx |= (uint32_t)(epc->size & 0xfffff000);
 		best->edx = epc ? (uint32_t)(epc->size >> 32) : 0;
 	}
-	printk("2: update_sgx is called %x %x %x %x\n", best->eax,best->ebx,best->ecx,best->edx);
-
-	//Jupark 
 	best = kvm_find_cpuid_entry(vcpu, 0x12, 0x3);
-	printk("3: update_sgx is called %x %x %x %x\n", best->eax,best->ebx,best->ecx,best->edx);
 	if (best) {
-		//Jupark
-		printk("3.5: update_sgx is called\n");
 		best->eax &= 0xf;
 		if (o_epc)
 			best->eax |= (uint32_t)(o_epc->base & 0xfffff000);
@@ -10646,7 +11060,6 @@ static int vmx_cpuid_update_sgx(struct kvm_vcpu *vcpu)
 			best->ecx |= (uint32_t)(o_epc->size & 0xfffff000);
 		best->edx = o_epc ? (uint32_t)(o_epc->size >> 32) : 0;
 	}
-	printk("3: update_sgx is called %x %x %x %x\n", best->eax,best->ebx,best->ecx,best->edx);
 #endif
 	return 0;
 }
@@ -11469,8 +11882,12 @@ static int prepare_vmcs02(struct kvm_vcpu *vcpu, struct vmcs12 *vmcs12,
 		if (exec_control & SECONDARY_EXEC_VIRTUALIZE_APIC_ACCESSES)
 			vmcs_write64(APIC_ACCESS_ADDR, -1ull);
 
-		if (exec_control & SECONDARY_EXEC_ENCLS_EXITING)
+//		if (exec_control & SECONDARY_EXEC_ENCLU_EXITING){
+//			vmx_write_enclu_bitmap(vcpu, vmcs12);
+//		}
+		if (exec_control & SECONDARY_EXEC_ENCLS_EXITING){
 			vmx_write_encls_bitmap(vcpu, vmcs12);
+		}
 
 		vmcs_write32(SECONDARY_VM_EXEC_CONTROL, exec_control);
 	}

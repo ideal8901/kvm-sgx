@@ -65,6 +65,8 @@
 #include <linux/sched/signal.h>
 #include <linux/slab.h>
 
+//#include <linux/cma.h>
+
 #include <asm/sgx.h>
 
 bool sgx_enabled __ro_after_init = false;
@@ -90,6 +92,15 @@ static DEFINE_SPINLOCK(sgx_free_list_lock);
 static LIST_HEAD(sgx_global_lru);
 static DEFINE_SPINLOCK(sgx_global_lru_lock);
 
+//For outer enclave
+static unsigned int sgx_nr_o_total_epc_pages __ro_after_init;
+static unsigned int sgx_nr_o_free_pages;
+static unsigned int sgx_nr_o_low_pages = SGX_NR_LOW_EPC_PAGES_DEFAULT;
+static unsigned int sgx_nr_o_high_pages = SGX_NR_LOW_EPC_PAGES_DEFAULT * 2;
+static LIST_HEAD(sgx_o_free_list);
+static DEFINE_SPINLOCK(sgx_o_free_list_lock);
+
+
 struct sgx_epc_bank {
 	unsigned long pa;
 #ifdef CONFIG_X86_64
@@ -100,6 +111,93 @@ struct sgx_epc_bank {
 #define SGX_MAX_EPC_BANKS 8
 static struct sgx_epc_bank sgx_epc_banks[SGX_MAX_EPC_BANKS] __ro_after_init;
 static int sgx_nr_epc_banks __ro_after_init;
+
+// for outer epc 
+//from 2.6.5.2
+
+typedef enum {
+    PT_SECS = 0x00,                     // Page is SECS
+    PT_TCS  = 0x01,                     // Page is TCS
+    PT_REG  = 0x02,                     // Page is a normal page
+    PT_VA   = 0x03,                     // Page is a Version Array
+    PT_TRIM = 0x04                      // Page is in trimmed state
+} page_type_t;
+
+typedef struct {
+    unsigned int valid:1;               // Indicates whether EPCM entry is valid
+    unsigned int read:1;                // Enclave Read accesses allowed for page
+    unsigned int write:1;               // Enclave Write accesses allowed for page
+    unsigned int execute:1;             // Enclave Execute accesses allowed for page
+    page_type_t  page_type;             // EPCM page type (PT_SECS, PT_TCS, PT_REG, PT_VA, PT_TRIM)
+    uint64_t enclave_secs;              // SECS identifier of enclave to which page belongs
+    uint64_t enclave_addr;              // Linear enclave address of the page
+    unsigned int blocked:1;             // Indicates whether the page is in the blocked state
+    unsigned int pending:1;             // Indicates whether the page is in the pending state
+    unsigned int modified:1;            // Indicates whether the page is in the modified state
+
+    // XXX?
+    uint64_t epcPageAddress;            // Maps EPCM <-> EPC ( enclaveAddress seems to have a different functionality
+    uint64_t appAddress;                // Track App address - EPC address
+} epcm_entry_t;
+
+static epcm_entry_t* epcm;
+
+// Searches EPCM for effective address
+uint16_t epcm_search(resource_size_t pa)
+{
+
+#ifdef CONFIG_X86_32
+	int i = (pa & ~PAGE_MASK);
+	return PFN_DOWN(pa - sgx_epc_banks[i].pa);
+#else
+	int i = (pa & ~PAGE_MASK);
+	return (((pa & PAGE_MASK) - sgx_epc_banks[i].pa) / PAGE_SIZE);
+#endif
+//	uint16_t i;
+//	int16_t index = -1;
+//
+//	for (i = 0; i < sgx_nr_o_total_epc_pages; i ++) {
+//	    // Can be in between page addresses. for example: EEXTEND : 256 chunks && EWB : Version Array (VA)
+//	    if ((epcm[i].epcPageAddress <= (uint64_t)addr)
+//	            && ((uint64_t)addr < epcm[i].epcPageAddress + PAGE_SIZE)) {
+//	        index = i;
+//	        break;
+//	    }
+//	}
+//	
+////	if (index == -1) {
+////	    sgx_msg(warn, "Fail to get epcm index addr: %lx");
+////	      raise_exception(env, EXCP0D_GPF);
+////	}
+//	
+//	return (uint16_t)index;
+}
+EXPORT_SYMBOL(epcm_search);
+
+// Set fields of epcm_entry
+void set_epcm_entry(uint16_t index, bool valid, bool read, bool write,
+                    bool execute, bool blocked, uint8_t pt, uint64_t secs,
+                    uint64_t addr)
+{
+    epcm[index].valid        = valid;
+    epcm[index].read         = read;
+    epcm[index].write        = write;
+    epcm[index].execute      = execute;
+    epcm[index].blocked      = blocked;
+    epcm[index].page_type    = pt;
+    epcm[index].enclave_secs = secs;
+    epcm[index].enclave_addr = addr;
+}
+EXPORT_SYMBOL(set_epcm_entry);
+
+
+// Get SECS of enclave based on epcm of EPC page
+struct sgx_secs* get_secs_address(uint16_t index)
+{
+    return (struct sgx_secs *)epcm[index].enclave_secs;
+}
+EXPORT_SYMBOL(get_secs_address);
+
 
 void sgx_page_reclaimable(struct sgx_epc_page *epc_page)
 {
@@ -218,6 +316,29 @@ static struct sgx_epc_page *sgx_alloc_page_fast(void *owner,
 	return entry;
 }
 
+static struct sgx_epc_page *sgx_alloc_outer_page_fast(void *owner,
+						struct sgx_epc_operations *ops)
+{
+	struct sgx_epc_page *entry = NULL;
+
+	if (WARN_ON(!owner || !ops))
+		return entry;
+
+	spin_lock(&sgx_o_free_list_lock);
+
+	if (!list_empty(&sgx_o_free_list)) {
+		entry = list_first_entry(&sgx_o_free_list, struct sgx_epc_page,
+					 list);
+		list_del_init(&entry->list);
+		sgx_nr_o_free_pages--;
+		entry->owner = owner;
+		entry->ops = ops;
+	}
+
+	spin_unlock(&sgx_o_free_list_lock);
+
+	return entry;
+}
 /**
  * sgx_alloc_page - allocate an EPC page
  * @flags:	allocation flags
@@ -268,11 +389,82 @@ struct sgx_epc_page *sgx_alloc_page(unsigned int flags, void *owner,
 }
 EXPORT_SYMBOL(sgx_alloc_page);
 
-int sgx_batch_alloc_pages(int nr_pages, struct list_head *dst,
+struct sgx_epc_page *sgx_alloc_outer_page(unsigned int flags, void *owner,
+				    struct sgx_epc_operations *ops)
+{
+	struct sgx_epc_page *entry;
+
+	for ( ; ; ) {
+		entry = sgx_alloc_outer_page_fast(owner, ops);
+		if (entry)
+			break;
+
+		if (list_empty(&sgx_global_lru)) {
+			entry = ERR_PTR(-ENOMEM);
+			break;
+		}
+
+		if (flags & SGX_ALLOC_ATOMIC) {
+			entry = ERR_PTR(-EBUSY);
+			break;
+		}
+
+		if (signal_pending(current)) {
+			entry = ERR_PTR(-ERESTARTSYS);
+			break;
+		}
+
+		sgx_swap_pages(SGX_NR_EPC_PAGES_TO_SCAN);
+		schedule();
+	}
+
+	if (sgx_nr_o_free_pages < sgx_nr_low_pages)
+		wake_up(&ksgxswapd_waitq);
+
+	return entry;
+}
+EXPORT_SYMBOL(sgx_alloc_outer_page);
+
+int sgx_batch_alloc_outer_pages(int nr_pages, struct list_head *dst,
 			  void *owner, struct sgx_epc_operations *ops)
 {
 	int i = 0;
 	struct sgx_epc_page *entry, *tmp;
+
+	pr_info("jupark: text moudle_____\n");
+	pr_info("jupark: OEPC bank %d\n", sgx_nr_o_free_pages);
+	pr_info("jupark: required nr_pages %d\n", nr_pages);
+	spin_lock(&sgx_o_free_list_lock);
+	if (nr_pages > sgx_nr_o_free_pages)
+		goto out;
+
+	sgx_nr_o_free_pages -= nr_pages;
+
+	for (i = 0; i < nr_pages && !list_empty(&sgx_o_free_list); i++) {
+		entry = list_first_entry(&sgx_o_free_list, struct sgx_epc_page,
+					 list);
+		list_move_tail(&entry->list, dst);
+	}
+	if (WARN_ON_ONCE(i < nr_pages)) {
+		list_for_each_entry_safe(entry, tmp, dst, list)
+			list_move_tail(&entry->list, &sgx_o_free_list);
+		sgx_nr_o_free_pages += nr_pages;
+	}
+out:
+	spin_unlock(&sgx_o_free_list_lock);
+	return (i < nr_pages) ? -ENOMEM : 0;
+}
+EXPORT_SYMBOL(sgx_batch_alloc_outer_pages);
+
+int sgx_batch_alloc_pages(int nr_pages, struct list_head *dst,
+			  void *owner, struct sgx_epc_operations *ops, bool is_outer)
+{
+	int i = 0;
+	struct sgx_epc_page *entry, *tmp;
+
+	if(is_outer){
+		return sgx_batch_alloc_outer_pages(nr_pages, dst, owner, ops);
+	}
 
 	spin_lock(&sgx_free_list_lock);
 	if (nr_pages > sgx_nr_free_pages)
@@ -311,6 +503,21 @@ void sgx_free_page(struct sgx_epc_page *entry)
 }
 EXPORT_SYMBOL(sgx_free_page);
 
+void sgx_free_outer_page(struct sgx_epc_page *entry)
+{
+	if (WARN_ON(!list_empty(&entry->list)))
+		sgx_page_defunct(entry);
+
+	entry->ops = NULL;
+	entry->owner = NULL;
+
+	spin_lock(&sgx_o_free_list_lock);
+	list_add(&entry->list, &sgx_o_free_list);
+	sgx_nr_o_free_pages++;
+	spin_unlock(&sgx_o_free_list_lock);
+}
+EXPORT_SYMBOL(sgx_free_outer_page);
+
 void *__sgx_get_page(resource_size_t pa)
 {
 #ifdef CONFIG_X86_32
@@ -331,6 +538,20 @@ void sgx_put_page(void *epc_page_vaddr)
 #endif
 }
 EXPORT_SYMBOL(sgx_put_page);
+
+void *__sgx_get_outer_page(resource_size_t pa)
+{
+	return kmap_atomic_pfn(PFN_DOWN(pa));
+//	return (void *)(sgx_epc_banks[1].va +
+//		((pa & PAGE_MASK) - sgx_epc_banks[1].pa));
+}
+EXPORT_SYMBOL(__sgx_get_outer_page);
+
+void sgx_put_outer_page(void *epc_page_vaddr)
+{
+	kunmap_atomic(epc_page_vaddr);
+}
+EXPORT_SYMBOL(sgx_put_outer_page);
 
 int sgx_einit(void *sigstruct, struct sgx_einittoken *einittoken,
 	      void *secs, u64 le_pubkey_hash[4])
@@ -450,9 +671,17 @@ static __init void sgx_teardown_epc(void)
 	}
 	spin_unlock(&sgx_free_list_lock);
 
+	spin_lock(&sgx_o_free_list_lock);
+	list_for_each_entry_safe(entry, tmp, &sgx_o_free_list, list) {
+		list_del(&entry->list);
+		kfree(entry);
+	}
+	spin_unlock(&sgx_o_free_list_lock);
+
 #ifdef CONFIG_X86_64
-	for (i = 0; i < sgx_nr_epc_banks; i++)
+	for (i = 0; i < sgx_nr_epc_banks-1; i++)
 		iounmap((void *)sgx_epc_banks[i].va);
+	kfree(sgx_epc_banks[i].va);
 #endif
 }
 
@@ -485,14 +714,48 @@ err_freelist:
 	return -ENOMEM;
 }
 
+static __init int sgx_add_o_epc_bank(resource_size_t start, unsigned long size, int bank)
+{
+	unsigned long i;
+	struct sgx_epc_page *new_epc_page, *entry;
+	unsigned int nr_pages = 0;
+	LIST_HEAD(epc_pages);
+
+	for (i = 0; i < size; i += PAGE_SIZE) {
+		new_epc_page = kzalloc(sizeof(*new_epc_page), GFP_KERNEL);
+		if (!new_epc_page)
+			goto err_freelist;
+		new_epc_page->pa = (start + i) | bank;
+
+//		epcm[nr_pages].epcPageAddress  = new_epc_page->pa;
+
+		list_add_tail(&new_epc_page->list, &epc_pages);
+		nr_pages++;
+	}
+
+	spin_lock(&sgx_o_free_list_lock);
+	list_splice_tail(&epc_pages, &sgx_o_free_list);
+	sgx_nr_o_total_epc_pages += nr_pages;
+	sgx_nr_o_free_pages += nr_pages;
+	spin_unlock(&sgx_o_free_list_lock);
+	return 0;
+err_freelist:
+	list_for_each_entry(entry, &epc_pages, list)
+		kfree(entry);
+	return -ENOMEM;
+}
+
 static __init int sgx_init_epc(void)
 {
 	int i, ret;
 	unsigned int eax, ebx, ecx, edx;
 	unsigned long pa, size;
 
+	struct page* test_page;
+
 	ret = -ENODEV;
 
+	//Get real epc memory addresses. 
 	for (i = 0; i < SGX_MAX_EPC_BANKS; i++) {
 		cpuid_count(SGX_CPUID, i + 2, &eax, &ebx, &ecx, &edx);
 		if (!(eax & 0xf))
@@ -506,6 +769,9 @@ static __init int sgx_init_epc(void)
 		sgx_epc_banks[i].pa = pa;
 		sgx_epc_banks[i].size = size;
 	}
+
+	//sgx_epc_banks[i-1].size = size / 2;
+	sgx_epc_banks[i].size = size;
 
 	sgx_nr_epc_banks = i;
 
@@ -533,8 +799,41 @@ static __init int sgx_init_epc(void)
 
 	sgx_nr_epc_banks = i;
 
-	if (sgx_nr_epc_banks)
+	if (sgx_nr_epc_banks){
 		ret = 0;
+	}
+
+	//Jupark. ADD OEPC as for epc banks 
+	//test_page = alloc_pages(0, 11);
+
+	//pr_info("jupark: page_to_phys(test_page) %x\n", page_to_phys(test_page));
+	//sgx_epc_banks[i].pa = sgx_epc_banks[i-1].pa + sgx_epc_banks[i-1].size; //page_to_phys(test_page);
+	sgx_epc_banks[i].pa = 0x600000000;
+	//sgx_epc_banks[i].size = 1024 * 8 << PAGE_SHIFT;
+	//sgx_epc_banks[i].va = kzalloc(sgx_epc_banks[i].size, GFP_KERNEL);
+
+	pr_info("jupark: sgx_epc_bank i pa = %llx size %llx\n",sgx_epc_banks[i].pa, sgx_epc_banks[i].size);
+	pr_info("jupark: sgx_epc_bank i-1 pa = %llx size %llx\n",sgx_epc_banks[i-1].pa, sgx_epc_banks[i-1].size);
+
+//	sgx_epc_banks[i].va = (unsigned long)
+//		ioremap_cache(sgx_epc_banks[i].pa,
+//			sgx_epc_banks[i].size);
+//
+//	if (!sgx_epc_banks[i].va) {
+//		pr_warn("intel_sgx: ioremap_cache of Outer EPC failed\n");
+//		ret = -ENOMEM;
+//////		//break;
+//	}
+
+	epcm = kzalloc(sizeof(epcm_entry_t) * (sgx_epc_banks[i].size / PAGE_SIZE), GFP_KERNEL);
+
+	ret = sgx_add_o_epc_bank(sgx_epc_banks[i].pa,
+			       sgx_epc_banks[i].size, i);
+	if (ret) {
+		pr_warn("intel_sgx: sgx_add_outer_epc_bank failed\n");
+	}
+	sgx_nr_epc_banks+=1;
+	
 	return ret;
 }
 
@@ -551,6 +850,7 @@ static __init int sgx_init(void)
 	int ret;
 	bool lc_enabled = false;
 
+	pr_info("jupark: %s", __func__);
 	ret = sgx_check_support(&lc_enabled);
 	if (ret)
 		return ret;

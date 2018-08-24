@@ -27,6 +27,8 @@
 #define KVM_HC_MIPS_CONSOLE_OUTPUT	8
 #define KVM_HC_CLOCK_PAIRING		9
 
+#define KVM_ENCLU_OEENTER		21	
+#define KVM_ENCLU_OEEXIT		22	
 /*
  * hypercalls use architecture specific
  */
