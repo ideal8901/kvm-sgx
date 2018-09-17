@@ -1353,16 +1353,22 @@ static int sgx_remove_page(struct sgx_epc_page *epc_page, bool is_outer)
 	int ret;
 	void *va;
 
+
 	list_del_init(&epc_page->list);
+	printk("sgx_remove_page is called \n");
 
-	va = sgx_get_page(epc_page);
-	ret = __eremove(va);
-	sgx_put_page(va);
-
-	if (!ret && is_outer)
+	if (!ret && is_outer){
+		va = sgx_get_outer_page(epc_page);
+		//ret = __eremove(va);
+		sgx_put_outer_page(va);
 		sgx_free_outer_page(epc_page);
-	else if(!ret)
+	}
+	else if(!ret){
+		va = sgx_get_page(epc_page);
+		ret = __eremove(va);
+		sgx_put_page(va);
 		sgx_free_page(epc_page);
+	}
 
 	return ret;
 }
@@ -1387,6 +1393,8 @@ static void vmx_destroy_sgx_epc(struct kvm *kvm)
 	 * at which point all children should be removed and the
 	 * SECS can be nuked as well.
 	 */
+
+	printk("vmx_destory_sgx_epc is called \n");
 	list_for_each_entry_safe(entry, tmp, &epc->used, list) {
 		if (sgx_remove_page(entry, false))
 			list_add(&entry->list, &secs_pages);
@@ -6857,20 +6865,20 @@ static int sgx_o_eexit(struct kvm_vcpu *vcpu);
 static int handle_vmcall(struct kvm_vcpu *vcpu)
 {
 	u32 rax = (u32)vcpu->arch.regs[VCPU_REGS_RAX];
-	u32 rbx = (u32)vcpu->arch.regs[VCPU_REGS_RBX];
-	u32 rcx = (u32)vcpu->arch.regs[VCPU_REGS_RCX];
-	u32 rdx = (u32)vcpu->arch.regs[VCPU_REGS_RDX];
+//	u32 rbx = (u32)vcpu->arch.regs[VCPU_REGS_RBX];
+//	u32 rcx = (u32)vcpu->arch.regs[VCPU_REGS_RCX];
+//	u32 rdx = (u32)vcpu->arch.regs[VCPU_REGS_RDX];
 
 	switch(rax){
 		case KVM_ENCLU_OEENTER: // 21	
+//			printk("Jupark : handle_vmcall rax = %d\n", rax);
 			//kvm_register_write(vcpu, VCPU_REGS_RAX, 0);
-			sgx_o_eenter(vcpu);
-			break;
+			return sgx_o_eenter(vcpu);
 	
 		case KVM_ENCLU_OEEXIT: // 22
+//			printk("Jupark : handle_vmcall rax = %d\n", rax);
 			//kvm_register_write(vcpu, VCPU_REGS_RAX, 0);
-			sgx_o_eexit(vcpu);
-			break;
+			return sgx_o_eexit(vcpu);
 	default:
 		return kvm_emulate_hypercall(vcpu);
 	}
@@ -8867,6 +8875,11 @@ static void* gva_to_hva(struct kvm_vcpu *vcpu, void* vaddr, bool in_epc){
 	gpa_t paddr;
 
 	paddr = (void *)kvm_mmu_gva_to_gpa_write(vcpu, vaddr, &ex);
+	if (paddr == UNMAPPED_GVA)
+	{
+		printk("Jupark : gva_to_hva paddr has problems\n");
+		return -EFAULT;
+	}
 
 	if(in_epc){
 		kvm_pfn_t pfn;
@@ -8932,20 +8945,17 @@ static int sgx_o_ecreate(struct kvm_vcpu *vcpu)
 //	struct sgx_secs *tmp_secs_pi = gva_to_hva(vcpu, pginfo->secs, false);
 //	void *tmp_linaddr = gva_to_hva(vcpu, pginfo->linaddr, false);
 
-	printk("1 ocreate\n");
-	printk("1 pginfo_vaddr %llx\n", pginfo_vaddr);
-	printk("1 pginfo %llx\n", pginfo);
-	printk("1 pginfo->srcpge %llx\n", pginfo->srcpge);
-	printk("1 tmp_srcpge %llx\n", tmp_srcpge);
+//	printk("1 ocreate\n");
+//	printk("1 pginfo_vaddr %llx\n", pginfo_vaddr);
+//	printk("1 pginfo %llx\n", pginfo);
+//	printk("1 pginfo->srcpge %llx\n", pginfo->srcpge);
+//	printk("1 tmp_srcpge %llx\n", tmp_srcpge);
 
 //	memset((void*)secs, 0, PAGE_SIZE);
-	printk("1 secs %llx\n", secs);
 	memcpy((void*)secs, tmp_srcpge, PAGE_SIZE);
-	printk("2 ocreate\n");
 
-	if (secs)
-		sgx_put_outer_page(secs);
-	//sgx_put_page
+	printk("oecreate %x secs_pfn\n", secs_pfn);
+	printk("oecreate %x secs->base\n", secs->base);
 
 	uint16_t index_secs = epcm_search(secs_pfn << PAGE_SHIFT);
   	set_epcm_entry(index_secs, 1, 0, 0, 0, 0, PT_SECS, 0, 0);
@@ -9020,15 +9030,19 @@ static int sgx_o_eadd(struct kvm_vcpu *vcpu)
 	uint16_t index = epcm_search(dest_pfn << PAGE_SHIFT);
 	set_epcm_entry(index, 1, 0,
 	               0, 0, 0,
-	               PT_REG, (uint64_t)secs_pfn << PAGE_SHIFT,
+	               PT_REG, (uint64_t)secs_pfn,
 	               (uintptr_t)tmp_linaddr);
 
-	kvm_register_write(vcpu, VCPU_REGS_RAX, 0);
+	printk("oeadd %x secs_pfn\n", secs_pfn);
+	printk("oeadd %x secs->base\n", secs->base);
 
-	if (secs)
-		sgx_put_outer_page(secs);
-	if (dest)
-		sgx_put_outer_page(dest);
+//	if (secs)
+//		sgx_put_outer_page(secs);
+//	if (dest)
+//		sgx_put_outer_page(dest);
+
+	kvm_register_write(vcpu, VCPU_REGS_RAX, 0);
+	kvm_skip_emulated_instruction(vcpu);
 
 	return 1;
 }
@@ -9050,75 +9064,126 @@ static int sgx_o_eenter(struct kvm_vcpu *vcpu)
 	// RCX: AEP(In, EA)
 	// RAX: Error(Out, ErrorCode)
 	// RCX: Address_IP_Following_EENTER(Out, EA)
-//	bool tmp_mode64;
-//	uint64_t tmp_fsbase;
-////	uint64_t tmp_fslimit;
-//	uint64_t tmp_gsbase;
-////	uint64_t tmp_gslimit;
-//	uint64_t tmp_ssa;
-//	uint64_t tmp_xsize;
-//	uint64_t tmp_gpr;
-////	uint64_t tmp_target;
-//	uint64_t eid;
-////	uint16_t index_gpr;
-////	uint16_t index_tcs;
+	bool tmp_mode64;
+	uint64_t tmp_fsbase;
+//	uint64_t tmp_fslimit;
+	uint64_t tmp_gsbase;
+//	uint64_t tmp_gslimit;
+	uint64_t tmp_gpr;
+//	uint64_t tmp_target;
+	uint64_t eid;
+//	uint16_t index_gpr;
+//	uint16_t index_tcs;
+
+	struct x86_exception ex = { .vector = 0 };
+
+	uint64_t *aep = (uint64_t *)vcpu->arch.regs[VCPU_REGS_RCX];
 //
-//	struct x86_exception ex = { .vector = 0 };
+	void *tcs_vaddr = (void *)vcpu->arch.regs[VCPU_REGS_RBX];
+	gpa_t tcs_paddr = (void *)kvm_mmu_gva_to_gpa_write(vcpu, tcs_vaddr, &ex);
 //
-//	uint64_t *aep = (uint64_t *)vcpu->arch.regs[VCPU_REGS_RCX];
-////
-//	void *tcs_vaddr = (void *)vcpu->arch.regs[VCPU_REGS_RBX];
-//	gpa_t tcs_paddr = (void *)kvm_mmu_gva_to_gpa_write(vcpu, tcs_vaddr, &ex);
-//	kvm_pfn_t tcs_pfn = gfn_to_pfn(vcpu->kvm, PFN_DOWN(tcs_paddr));
-//	struct sgx_tcs *tcs;// = __sgx_get_page(tcs_pfn << PAGE_SHIFT);
-//	tcs = gva_to_hva(vcpu, tcs_vaddr, true);
+//	if (tcs_paddr == UNMAPPED_GVA)
+//	{
+//		printk("Jupark : tcs_paddr has problems\n");
+//		skip_emulated_instruction(vcpu);
+//		return 1;
+//	}
+	kvm_pfn_t tcs_pfn = gfn_to_pfn(vcpu->kvm, PFN_DOWN(tcs_paddr));
+//	if (is_error_pfn(tcs_pfn))
+//	{
+//		skip_emulated_instruction(vcpu);
+//		return 1;
+//	}
+
+	struct sgx_tcs *tcs;// = __sgx_get_page(tcs_pfn << PAGE_SHIFT);
+	tcs = gva_to_hva(vcpu, tcs_vaddr, true);
+
+	uint16_t index_tcs = epcm_search(tcs_pfn << PAGE_SHIFT);
+	kvm_pfn_t secs_pfn =  get_secs_address(index_tcs); // TODO: Change when the ENCLS is implemented - pageinfo_t
+
+	if (secs_pfn == 0 || is_error_pfn(secs_pfn))
+	{
+		printk("Jupark : secs_pfn has problems\n");
+		skip_emulated_instruction(vcpu);
+		kvm_register_write(vcpu, VCPU_REGS_RAX, 0);
+		return 1;
+	}
+
+////	if (secs_gpa < epc->base || secs_gpa >= (epc->base + epc->size))
+////	{
+////		printk("Jupark : secs_gpa has problems\n");
+////		skip_emulated_instruction(vcpu);
+////		return 1;
+////	}
+
+
+//	---------------------------------------------------------------------------- fine until this line
+	struct sgx_secs *secs = __sgx_get_outer_page(secs_pfn << PAGE_SHIFT);
+
+	if (!secs)
+	{
+		printk("Jupark : secs hva has problems2\n");
+		kvm_register_write(vcpu, VCPU_REGS_RAX, 0);
+		skip_emulated_instruction(vcpu);
+		return 1;
+	}
+
+	void* secs_base = gva_to_hva(vcpu, secs->base, true);
+
+	kvm_register_write(vcpu, VCPU_REGS_RAX, 0);
+	skip_emulated_instruction(vcpu);
+	vmx_flush_tlb(vcpu);
+
+	return 0;
+
 //
-//	uint16_t index_tcs = epcm_search(tcs_pfn << PAGE_SHIFT);
-//	kvm_pfn_t secs_pfn =  PFN_DOWN((uint64_t)get_secs_address(index_tcs)); // TODO: Change when the ENCLS is implemented - pageinfo_t
-//	struct sgx_secs *secs = __sgx_get_outer_page(secs_pfn << PAGE_SHIFT);
-//
-//	// TODO add 32bit options
-//	tmp_fsbase = tcs->ofsbase + gva_to_hva(vcpu, secs->base, true);
-//	tmp_gsbase = tcs->ogsbase + gva_to_hva(vcpu, secs->base, true);
+//	if(secs_base == -EFAULT)
+//	{
+//		printk("Jupark : secs->base has problems2\n");
+//		skip_emulated_instruction(vcpu);
+//		return 1;
+//	}
+//	//tmp_gsbase = tcs->ogsbase + gva_to_hva(vcpu, secs->base, true);
+//	printk("Jupark : oeenter 10");
 //
 //	printk("oeenter %llx, %llx %x\n", secs->base, tcs->ofsbase, tcs->ogsbase);
 ////
 //	secs_eid_reserved_t *tmp_eid = (secs_eid_reserved_t *)secs->reserved4; //gva_to_hva(vcpu, secs->reserved4, true);
 //	eid = tmp_eid->eid_pad.eid; 
 ////
+	
 //	tmp_ssa = tcs->ossa + secs->base + PAGE_SIZE * secs->ssaframesize * (tcs->cssa);
 //	tmp_xsize = 576;  
+
+//	tmp_gpr = tmp_ssa + PAGE_SIZE * (secs->ssaframesize) - sizeof(gprsgx_t);
+//	index_gpr = epcm_search((void *)tmp_gpr, 
 //
-////	tmp_gpr = tmp_ssa + PAGE_SIZE * (secs->ssaframesize) - sizeof(gprsgx_t);
-////	index_gpr = epcm_search((void *)tmp_gpr, 
-////
-////	printk("3 oeenter\n");
-////	printk("index_tcs, secs_pfn in oeenter %d, %x\n", index_tcs, secs_pfn);
-//	
+//	printk("3 oeenter\n");
+//	printk("index_tcs, secs_pfn in oeenter %d, %x\n", index_tcs, secs_pfn);
+	
 //	kvm_register_write(vcpu, VCPU_REGS_RAX, tcs->cssa);
 //	if (secs)
 //		sgx_put_outer_page(secs);
 //
-//	vmx_flush_tlb(vcpu);
-//	//vmx_set_segment
-//	//kvm_register_write(vcpu, VCPU_REGS_RCX, tcs->cssa);
-//
-////struct kvm_segment {
-////	__u64 base;
-////	__u32 limit;
-////	__u16 selector;
-////	__u8  type;
-////	__u8  present, dpl, db, s, l, g, avl;
-////	__u8  unusable;
-////	__u8  padding;
-////};
-//
-////	void (*set_segment)(struct kvm_vcpu *vcpu,
-////			    struct kvm_segment *var, int seg);
-////	set_segment(vcpu,  
-//	//tlb_flush(vcpu);
-//
-	return 0;
+	//vmx_set_segment
+	//kvm_register_write(vcpu, VCPU_REGS_RCX, tcs->cssa);
+
+//struct kvm_segment {
+//	__u64 base;
+//	__u32 limit;
+//	__u16 selector;
+//	__u8  type;
+//	__u8  present, dpl, db, s, l, g, avl;
+//	__u8  unusable;
+//	__u8  padding;
+//};
+
+//	void (*set_segment)(struct kvm_vcpu *vcpu,
+//			    struct kvm_segment *var, int seg);
+//	set_segment(vcpu,  
+	//tlb_flush(vcpu);
+
+	return 1;
 }
 
 static int sgx_o_eexit(struct kvm_vcpu *vcpu)

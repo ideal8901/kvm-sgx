@@ -541,15 +541,15 @@ EXPORT_SYMBOL(sgx_put_page);
 
 void *__sgx_get_outer_page(resource_size_t pa)
 {
-	return kmap_atomic_pfn(PFN_DOWN(pa));
-//	return (void *)(sgx_epc_banks[1].va +
-//		((pa & PAGE_MASK) - sgx_epc_banks[1].pa));
+	//return kmap_atomic_pfn(PFN_DOWN(pa));
+	return (void *)(sgx_epc_banks[1].va +
+		((pa & PAGE_MASK) - sgx_epc_banks[1].pa));
 }
 EXPORT_SYMBOL(__sgx_get_outer_page);
 
 void sgx_put_outer_page(void *epc_page_vaddr)
 {
-	kunmap_atomic(epc_page_vaddr);
+//	kunmap_atomic(epc_page_vaddr);
 }
 EXPORT_SYMBOL(sgx_put_outer_page);
 
@@ -808,29 +808,35 @@ static __init int sgx_init_epc(void)
 
 	//pr_info("jupark: page_to_phys(test_page) %x\n", page_to_phys(test_page));
 	//sgx_epc_banks[i].pa = sgx_epc_banks[i-1].pa + sgx_epc_banks[i-1].size; //page_to_phys(test_page);
-	sgx_epc_banks[i].pa = 0x600000000;
+	sgx_epc_banks[i].pa = 0x60000000;
 	//sgx_epc_banks[i].size = 1024 * 8 << PAGE_SHIFT;
 	//sgx_epc_banks[i].va = kzalloc(sgx_epc_banks[i].size, GFP_KERNEL);
 
 	pr_info("jupark: sgx_epc_bank i pa = %llx size %llx\n",sgx_epc_banks[i].pa, sgx_epc_banks[i].size);
 	pr_info("jupark: sgx_epc_bank i-1 pa = %llx size %llx\n",sgx_epc_banks[i-1].pa, sgx_epc_banks[i-1].size);
 
+	sgx_epc_banks[i].va = (unsigned long)
+		ioremap(sgx_epc_banks[i].pa,
+			sgx_epc_banks[i].size);
+
 //	sgx_epc_banks[i].va = (unsigned long)
-//		ioremap_cache(sgx_epc_banks[i].pa,
-//			sgx_epc_banks[i].size);
+//		ioremap(sgx_epc_banks[i].pa,
+//			PAGE_SIZE);
 //
-//	if (!sgx_epc_banks[i].va) {
-//		pr_warn("intel_sgx: ioremap_cache of Outer EPC failed\n");
-//		ret = -ENOMEM;
-//////		//break;
-//	}
+	if (!sgx_epc_banks[i].va) {
+		pr_warn("jupark ioremap_cache of Outer EPC failed\n");
+		ret = -ENOMEM;
+	}
+
+	pr_info("jupark: sgx_epc_bank i va = %llx\n",sgx_epc_banks[i].va);
+
 
 	epcm = kzalloc(sizeof(epcm_entry_t) * (sgx_epc_banks[i].size / PAGE_SIZE), GFP_KERNEL);
 
 	ret = sgx_add_o_epc_bank(sgx_epc_banks[i].pa,
 			       sgx_epc_banks[i].size, i);
 	if (ret) {
-		pr_warn("intel_sgx: sgx_add_outer_epc_bank failed\n");
+		pr_warn("jupark: sgx_add_outer_epc_bank failed\n");
 	}
 	sgx_nr_epc_banks+=1;
 	
